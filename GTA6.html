@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GTA-like Prototype (JS + Three.js)</title>
+  <style>
+    html,body{height:100%;margin:0;overflow:hidden;background:#111}
+    #info{position:fixed;left:10px;top:10px;color:#fff;font-family:monospace;z-index:10}
+    #instructions{position:fixed;left:10px;bottom:10px;color:#ddd;font-family:monospace;z-index:10}
+    canvas{display:block}
+  </style>
+</head>
+<body>
+  <div id="info">GTA6 Prototype — WASD move • Shift run • Space jump • E enter/exit vehicle • LMB shoot</div>
+  <div id="instructions">Open in a modern browser. Click to lock pointer for mouse look (or hold LMB and drag as fallback).</div>
+
+<script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+<script>
+// Single-file GTA-like prototype in JavaScript + Three.js
+// FIX (v3): Avoid calling requestPointerLock when the page is sandboxed without 'allow-pointer-lock'.
+// Also fixed variable initialization order, removed duplicate listeners, and added a tiny test for sandbox detection.
+
+// ---------- Init scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 2000);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+hemi.position.set(0,200,0); scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.8); dir.position.set(-100,200,100); scene.add(dir);
+
+// Ground
+const groundMat = new THREE.MeshStandardMaterial({color:0x2e8b57});
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(2000,2000), groundMat);
+ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
+
+// Simple city: some boxes as buildings
+const buildingMat = new THREE.MeshStandardMaterial({color:0x999999});
+for(let i=0;i<120;i++){
+  const w = 6+Math.random()*30, h = 6+Math.random()*60, d = 6+Math.random()*30;
+  const b = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), buildingMat);
+  b.position.set((Math.random()-0.5)*800, h/2, (Math.random()-0.5)*800);
+  scene.add(b);
+}
+
+// ---------- Utilities ----------
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+
+// robust angle difference in radians (returns value in (-PI, PI])
+function deltaAngle(a,b){
+  let diff = (b - a) % (2*Math.PI);
+  if(diff <= -Math.PI) diff += 2*Math.PI;
+  if(diff > Math.PI) diff -= 2*Math.PI;
+  return diff;
+}
+
+// lerp between two angles a -> b by t in [0,1] using shortest path
+function lerpAngle(a,b,t){
+  return a + deltaAngle(a,b) * t;
+}
+
+// ---------- Player ----------
+class Player {
+  constructor(){
+    this.group = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1,1.8,0.6), new THREE.MeshStandardMaterial({color:0x3333ff}));
+    body.position.y = 0.9; this.group.add(body);
+    scene.add(this.group);
+
+    this.pos = new THREE.Vector3(0,0,0);
+    this.velocity = new THREE.Vector3();
+    this.speed = 0; this.baseSpeed = 6; this.runSpeed = 11;
+    this.onGround = true; this.gravity = -30; this.jumpImpulse = 10;
+
+    this.yaw = 0; this.pitch = 0;
+    this.health = 100;
+
+    this.inVehicle = null;
+  }
+  update(dt,input){
+    if(this.inVehicle) return; // control handed to vehicle
+    // movement relative to camera forward
+    const forward = new THREE.Vector3(); camera.getWorldDirection(forward); forward.y=0; forward.normalize();
+    const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0,1,0), forward).normalize();
+
+    let move = new THREE.Vector3();
+    if(input.forward) move.add(forward);
+    if(input.back) move.sub(forward);
+    if(input.left) move.sub(right);
+    if(input.right) move.add(right);
+    move.normalize();
+
+    const running = input.shift; this.speed = running ? this.runSpeed : this.baseSpeed;
+    const targetVel = move.multiplyScalar(this.speed);
+
+    // Simple accel
+    this.velocity.x += (targetVel.x - this.velocity.x) * clamp(10*dt,0,1);
+    this.velocity.z += (targetVel.z - this.velocity.z) * clamp(10*dt,0,1);
+
+    // gravity
+    if(!this.onGround) this.velocity.y += this.gravity * dt;
+
+    // jump
+    if(input.jump && this.onGround){ this.velocity.y = this.jumpImpulse; this.onGround = false; }
+
+    // integrate
+    this.pos.addScaledVector(this.velocity, dt);
+    if(this.pos.y < 0){ this.pos.y = 0; this.velocity.y = 0; this.onGround = true; }
+
+    // rotate towards movement using our safe lerpAngle
+    if(move.lengthSq() > 0.001){
+      const dir = new THREE.Vector3(this.velocity.x,0,this.velocity.z).normalize();
+      // if velocity is almost zero, fall back to movement direction
+      if(dir.lengthSq() < 0.0001) dir.copy(move);
+      const angle = Math.atan2(dir.x, dir.z);
+      this.group.rotation.y = lerpAngle(this.group.rotation.y, angle, clamp(12*dt,0,1));
+    }
+
+    this.group.position.copy(this.pos);
+  }
+}
+
+// ---------- Vehicle ----------
+class Vehicle {
+  constructor(pos){
+    this.group = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(2.2,0.8,4), new THREE.MeshStandardMaterial({color:0xff3333}));
+    body.position.y = 0.6; this.group.add(body);
+    scene.add(this.group);
+    this.group.position.copy(pos);
+
+    this.pos = pos.clone(); this.velocity = new THREE.Vector3(); this.accel = 0;
+    this.maxSpeed = 40; this.turnSpeed = 2.5; this.brake = 6;
+    this.driver = null; // Player reference
+  }
+  update(dt,input){
+    if(this.driver){
+      // control
+      const forward = new THREE.Vector3(0,0,1).applyQuaternion(this.group.quaternion);
+      // throttle
+      if(input.forward) this.accel += 50*dt; else if(input.back) this.accel -= 50*dt; else this.accel += -this.accel*3*dt;
+      this.accel = clamp(this.accel, -this.maxSpeed, this.maxSpeed);
+      // steering
+      if(input.left) this.group.rotation.y += this.turnSpeed * dt * (this.accel>=0?1:-1);
+      if(input.right) this.group.rotation.y -= this.turnSpeed * dt * (this.accel>=0?1:-1);
+
+      // apply velocity
+      const fwd = new THREE.Vector3(0,0,1).applyQuaternion(this.group.quaternion).normalize();
+      this.velocity.copy(fwd).multiplyScalar(this.accel);
+      // simple friction
+      this.velocity.multiplyScalar(1 - clamp(1.5*dt,0,1));
+      this.pos.addScaledVector(this.velocity, dt);
+      this.group.position.copy(this.pos);
+      // sync driver to vehicle
+      this.driver.group.position.copy(this.group.position).add(new THREE.Vector3(0,0.2,0));
+      this.driver.group.rotation.copy(this.group.rotation);
+    }
+  }
+  enter(player){
+    if(this.driver) return false;
+    this.driver = player; player.inVehicle = this; // player stops controlling him
+    // simple visual: hide the player model while in vehicle
+    player.group.visible = false;
+    return true;
+  }
+  exit(){
+    if(!this.driver) return;
+    const p = this.driver; this.driver = null; p.inVehicle = null;
+    // show model again and place player next to car
+    p.group.visible = true;
+    p.pos.copy(this.group.position).add(new THREE.Vector3(2,0,0));
+    p.group.position.copy(p.pos);
+  }
+}
+
+// ---------- NPC (simple wanderer) ----------
+class NPC{
+  constructor(pos){
+    this.group = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1,1.8,0.6), new THREE.MeshStandardMaterial({color:0x888800}));
+    body.position.y = 0.9; this.group.add(body);
+    scene.add(this.group);
+    this.pos = pos.clone(); this.group.position.copy(this.pos);
+    this.dir = new THREE.Vector3(Math.random()-0.5,0,Math.random()-0.5).normalize();
+    this.speed = 2 + Math.random()*2;
+    this.timer = 0;
+  }
+  update(dt){
+    this.timer -= dt; if(this.timer <= 0){ this.dir.set(Math.random()-0.5,0,Math.random()-0.5).normalize(); this.timer = 1+Math.random()*3; }
+    this.pos.addScaledVector(this.dir, this.speed*dt);
+    // simple bounds
+    this.pos.x = clamp(this.pos.x, -900, 900); this.pos.z = clamp(this.pos.z, -900, 900);
+    this.group.position.copy(this.pos);
+    if(this.dir.lengthSq()>0.001){ const a = Math.atan2(this.dir.x, this.dir.z); this.group.rotation.y = a; }
+  }
+}
+
+// ---------- Projectiles ----------
+const projectiles = [];
+class Bullet{
+  constructor(pos, dir){
+    this.pos = pos.clone(); this.dir = dir.clone().normalize(); this.speed = 120; this.life = 3.0;
+    const geom = new THREE.SphereGeometry(0.08,8,8); const mat = new THREE.MeshStandardMaterial({emissive:0xffffaa});
+    this.mesh = new THREE.Mesh(geom, mat); this.mesh.position.copy(this.pos); scene.add(this.mesh);
+  }
+  update(dt){
+    this.pos.addScaledVector(this.dir, this.speed*dt); this.mesh.position.copy(this.pos); this.life -= dt;
+    // simple hit ground or buildings
+    if(this.pos.y < 0){ this.life = 0; }
+    // collide with NPCs (very simple)
+    for(const npc of npcs){ if(this.pos.distanceTo(npc.pos) < 1.0){ npc.group.scale.set(0.6,0.6,0.6); this.life = 0; }}
+  }
+  destroy(){ scene.remove(this.mesh); }
+}
+
+// ---------- Input ----------
+const input = {forward:false,back:false,left:false,right:false,jump:false,shift:false,shoot:false,enter:false};
+const keys = {
+  'KeyW':'forward','KeyS':'back','KeyA':'left','KeyD':'right','Space':'jump','ShiftLeft':'shift','ShiftRight':'shift'
+};
+window.addEventListener('keydown', e=>{ if(keys[e.code]) input[keys[e.code]] = true; if(e.code==='KeyE'){ input.enter = true; } });
+window.addEventListener('keyup', e=>{ if(keys[e.code]) input[keys[e.code]] = false; if(e.code==='KeyE'){ input.enter = false; } });
+
+// Pointer lock for mouse look with robust sandbox detection and fallback
+let pointerLocked = false;
+const sensitivity = 0.0025;
+const instr = document.getElementById('instructions');
+let dragToLook = false; // fallback mode when pointer lock isn't available
+let dragging = false; let lastMouseX = 0, lastMouseY = 0;
+let mouseDown = false; // declared early so listeners can safely reference it
+
+function isSandboxedWithoutPointerLock(){
+  try{
+    const fe = window.frameElement;
+    if(!fe) return false; // not in an iframe
+    // if the host provided a sandbox attribute and it doesn't contain allow-pointer-lock -> blocked
+    if(fe.hasAttribute && fe.hasAttribute('sandbox')){
+      const tokens = fe.sandbox;
+      if(tokens && typeof tokens.contains === 'function'){
+        return !tokens.contains('allow-pointer-lock');
+      }
+      // conservatively assume blocked if we can't inspect tokens
+      return true;
+    }
+    return false;
+  }catch(e){
+    // defensive: if anything goes wrong assume pointer lock not available
+    console.warn('Error checking frame sandbox:', e);
+    return true;
+  }
+}
+
+function canRequestPointerLock(){
+  try{
+    if(typeof renderer.domElement.requestPointerLock !== 'function') return false;
+    if(isSandboxedWithoutPointerLock()) return false;
+    return true;
+  }catch(e){ return false; }
+}
+
+// small test for sandbox detection (always a boolean)
+console.assert(typeof isSandboxedWithoutPointerLock() === 'boolean', 'sandbox check should return boolean');
+if(isSandboxedWithoutPointerLock()) console.log('Detected hosting frame sandbox that blocks pointer lock. Using drag-to-look fallback.');
+
+// pointer lock attempt (on click)
+document.body.addEventListener('click', ()=>{
+  if(pointerLocked || dragToLook) return; // already in a mode
+  if(!canRequestPointerLock()){
+    dragToLook = true;
+    instr.innerText = 'Pointer lock blocked by parent frame or browser — hold LMB and drag to look.';
+    return;
+  }
+  try{
+    renderer.domElement.requestPointerLock();
+  }catch(err){
+    console.warn('Pointer lock request threw:', err);
+    dragToLook = true;
+    instr.innerText = 'Pointer lock blocked by browser — hold LMB and drag to look.';
+  }
+});
+
+document.addEventListener('pointerlockerror', ()=>{
+  console.warn('Pointer lock error event fired');
+  dragToLook = true;
+  instr.innerText = 'Pointer lock error — hold LMB and drag to look.';
+});
+
+document.addEventListener('pointerlockchange', ()=>{
+  pointerLocked = document.pointerLockElement === renderer.domElement;
+  if(pointerLocked){ instr.innerText = 'Pointer locked — use mouse to look. Press ESC to release.'; }
+  else if(!dragToLook){ instr.innerText = 'Click to lock pointer (or hold LMB and drag to look).'; }
+});
+
+// mouse look handling (works both with pointer lock and drag-to-look fallback)
+let rotX = 0, rotY = 0;
+
+document.addEventListener('mousemove', (e)=>{
+  if(pointerLocked){
+    rotY -= e.movementX * sensitivity; rotX -= e.movementY * sensitivity; rotX = clamp(rotX, -1.2, 1.2);
+  } else if(dragToLook && dragging){
+    const dx = e.clientX - lastMouseX; const dy = e.clientY - lastMouseY;
+    rotY -= dx * sensitivity; rotX -= dy * sensitivity; rotX = clamp(rotX, -1.2, 1.2);
+    lastMouseX = e.clientX; lastMouseY = e.clientY;
+  }
+});
+
+window.addEventListener('mousedown', (e)=>{ mouseDown = true; if(dragToLook && e.button === 0){ dragging = true; lastMouseX = e.clientX; lastMouseY = e.clientY; }});
+window.addEventListener('mouseup', (e)=>{ mouseDown = false; if(dragToLook && e.button === 0) dragging = false; });
+
+// ---------- Init entities ----------
+const player = new Player(); player.pos.set(0,0,6); player.group.position.copy(player.pos);
+const vehicle = new Vehicle(new THREE.Vector3(6,0,8));
+const vehicle2 = new Vehicle(new THREE.Vector3(-12,0,-4));
+const npcs = [];
+for(let i=0;i<12;i++){ const p = new NPC(new THREE.Vector3((Math.random()-0.5)*200,0,(Math.random()-0.5)*200)); npcs.push(p); }
+
+// ---------- Camera third-person follow ----------
+const camOffset = new THREE.Vector3(0,4, -7);
+function updateCamera(dt){
+  if(player.inVehicle){
+    // follow vehicle
+    const targetPos = player.inVehicle.group.position.clone().add(new THREE.Vector3(0,2,0));
+    camera.position.lerp(targetPos.clone().add(camOffset.clone().applyQuaternion(player.inVehicle.group.quaternion)), 1 - Math.pow(0.001, dt));
+    camera.lookAt(player.inVehicle.group.position.clone().add(new THREE.Vector3(0,1.2,0)));
+  } else {
+    // rotate camera around player based on mouse (rotY, rotX updated by pointerlock or drag)
+    const theta = rotY; const phi = rotX;
+    const offset = new THREE.Vector3(0,0,1).applyAxisAngle(new THREE.Vector3(0,1,0), theta).multiplyScalar(-7);
+    offset.y = 4 + Math.sin(phi)*2;
+    const target = player.group.position.clone().add(new THREE.Vector3(0,1.2,0)).add(offset);
+    camera.position.lerp(target, 1 - Math.pow(0.001, dt));
+    camera.lookAt(player.group.position.clone().add(new THREE.Vector3(0,1.2,0)));
+  }
+}
+
+// ---------- Simple interaction: enter/exit vehicle & shooting ----------
+let lastShot = 0;
+function handleInteractions(dt){
+  // enter/exit
+  if(input.enter){
+    input.enter = false; // single press
+    // if in vehicle, exit
+    if(player.inVehicle){ player.inVehicle.exit(); }
+    else{
+      // check vehicles within 3 units
+      const vehicles = [vehicle, vehicle2];
+      for(const v of vehicles){ if(v.group.position.distanceTo(player.group.position) < 3){ v.enter(player); break; }}
+    }
+  }
+  // shooting: allow shooting when pointer locked OR when using drag-to-look fallback
+  lastShot -= dt; if((pointerLocked || dragToLook) && (mouseDown||input.shoot) && lastShot <= 0){ lastShot = 0.12; shoot(); }
+}
+
+function shoot(){
+  // fire from camera center
+  const origin = camera.position.clone();
+  const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
+  const b = new Bullet(origin.add(dir.clone().multiplyScalar(1.2)), dir);
+  projectiles.push(b);
+}
+
+// ---------- Resize ----------
+window.addEventListener('resize', ()=>{ camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+// ---------- Small unit-tests for angle helpers (developer/debug aid) ----------
+function approx(a,b,eps=1e-6){ return Math.abs(a-b) < eps; }
+console.assert(approx(lerpAngle(0, Math.PI, 0.5), Math.PI*0.5), 'lerpAngle 0->PI failed');
+(function(){
+  const a = Math.PI - 0.1, b = -Math.PI + 0.1, t = 0.5;
+  const expected = a + deltaAngle(a,b) * t; // expected computed via same delta logic
+  console.assert(approx(lerpAngle(a,b,t), expected), 'lerpAngle wrap-around test failed');
+})();
+console.assert(approx(lerpAngle(1.234,1.234,0.3), 1.234), 'lerpAngle identity test failed');
+console.assert(typeof isSandboxedWithoutPointerLock() === 'boolean', 'sandbox check should return boolean');
+console.log('Angle helper tests + sandbox test passed (see assertions).');
+
+// ---------- Main loop ----------
+let last = performance.now()/1000;
+function loop(){
+  const now = performance.now()/1000; const dt = Math.min(0.05, now - last); last = now;
+
+  // Update player or vehicle
+  player.update(dt, input);
+  vehicle.update(dt, input); vehicle2.update(dt, input);
+  for(const npc of npcs) npc.update(dt);
+  for(const p of projectiles){ p.update(dt); }
+  // cleanup bullets
+  for(let i=projectiles.length-1;i>=0;i--){ if(projectiles[i].life <= 0){ projectiles[i].destroy(); projectiles.splice(i,1); }}
+
+  // camera
+  updateCamera(dt);
+
+  // interactions
+  handleInteractions(dt);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+// place camera initially behind player
+camera.position.copy(new THREE.Vector3(0,4,8));
+camera.lookAt(player.group.position.clone().add(new THREE.Vector3(0,1.2,0)));
+loop();
+
+// ---------- Minor debug: show simple crosshair ----------
+const cross = document.createElement('div'); cross.style.position='fixed'; cross.style.left='50%'; cross.style.top='50%'; cross.style.transform='translate(-50%,-50%)'; cross.style.width='8px'; cross.style.height='8px'; cross.style.borderRadius='50%'; cross.style.background='rgba(255,255,255,0.7)'; cross.style.zIndex='9'; document.body.appendChild(cross);
+
+// ---------- End ----------
+</script>
+</body>
+</html>
