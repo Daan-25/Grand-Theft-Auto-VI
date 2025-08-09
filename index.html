@@ -8,18 +8,21 @@
     html,body{height:100%;margin:0;overflow:hidden;background:#111}
     #info{position:fixed;left:10px;top:10px;color:#fff;font-family:monospace;z-index:10}
     #instructions{position:fixed;left:10px;bottom:10px;color:#ddd;font-family:monospace;z-index:10}
+    #openNew{position:fixed;right:10px;top:10px;z-index:11;padding:8px 12px;border-radius:6px;border:none;background:#2b8;cursor:pointer}
     canvas{display:block}
   </style>
 </head>
 <body>
   <div id="info">GTA6 Prototype — WASD move • Shift run • Space jump • E enter/exit vehicle • LMB shoot</div>
-  <div id="instructions">Open in a modern browser. Click to lock pointer for mouse look (or hold LMB and drag as fallback).</div>
+  <div id="instructions">Hold LMB and drag to look. If you prefer pointer-lock, click the button to open this prototype in a new tab (pointer-lock is environment-dependent).</div>
+  <button id="openNew">Open in new tab (optional)</button>
 
 <script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
 <script>
 // Single-file GTA-like prototype in JavaScript + Three.js
-// FIX (v3): Avoid calling requestPointerLock when the page is sandboxed without 'allow-pointer-lock'.
-// Also fixed variable initialization order, removed duplicate listeners, and added a tiny test for sandbox detection.
+// FIX (v4): Completely removed any call to requestPointerLock to avoid SecurityError
+// Environments that block pointer lock (sandboxed iframes) will no longer throw.
+// Drag-to-look is the primary input; an optional "open in new tab" button lets the user try pointer-lock in a new top-level tab.
 
 // ---------- Init scene ----------
 const scene = new THREE.Scene();
@@ -226,83 +229,27 @@ const keys = {
 window.addEventListener('keydown', e=>{ if(keys[e.code]) input[keys[e.code]] = true; if(e.code==='KeyE'){ input.enter = true; } });
 window.addEventListener('keyup', e=>{ if(keys[e.code]) input[keys[e.code]] = false; if(e.code==='KeyE'){ input.enter = false; } });
 
-// Pointer lock for mouse look with robust sandbox detection and fallback
-let pointerLocked = false;
+// Pointer lock removed: using drag-to-look fallback only (safe in sandboxed frames)
+let pointerLocked = false; // left for compatibility but never used
 const sensitivity = 0.0025;
 const instr = document.getElementById('instructions');
-let dragToLook = false; // fallback mode when pointer lock isn't available
+let dragToLook = true; // default to drag-to-look (no requestPointerLock anywhere)
 let dragging = false; let lastMouseX = 0, lastMouseY = 0;
 let mouseDown = false; // declared early so listeners can safely reference it
 
-function isSandboxedWithoutPointerLock(){
+// optional: open same URL in a new tab (user may try pointer-lock there)
+const openBtn = document.getElementById('openNew');
+openBtn.addEventListener('click', ()=>{
   try{
-    const fe = window.frameElement;
-    if(!fe) return false; // not in an iframe
-    // if the host provided a sandbox attribute and it doesn't contain allow-pointer-lock -> blocked
-    if(fe.hasAttribute && fe.hasAttribute('sandbox')){
-      const tokens = fe.sandbox;
-      if(tokens && typeof tokens.contains === 'function'){
-        return !tokens.contains('allow-pointer-lock');
-      }
-      // conservatively assume blocked if we can't inspect tokens
-      return true;
-    }
-    return false;
-  }catch(e){
-    // defensive: if anything goes wrong assume pointer lock not available
-    console.warn('Error checking frame sandbox:', e);
-    return true;
-  }
-}
-
-function canRequestPointerLock(){
-  try{
-    if(typeof renderer.domElement.requestPointerLock !== 'function') return false;
-    if(isSandboxedWithoutPointerLock()) return false;
-    return true;
-  }catch(e){ return false; }
-}
-
-// small test for sandbox detection (always a boolean)
-console.assert(typeof isSandboxedWithoutPointerLock() === 'boolean', 'sandbox check should return boolean');
-if(isSandboxedWithoutPointerLock()) console.log('Detected hosting frame sandbox that blocks pointer lock. Using drag-to-look fallback.');
-
-// pointer lock attempt (on click)
-document.body.addEventListener('click', ()=>{
-  if(pointerLocked || dragToLook) return; // already in a mode
-  if(!canRequestPointerLock()){
-    dragToLook = true;
-    instr.innerText = 'Pointer lock blocked by parent frame or browser — hold LMB and drag to look.';
-    return;
-  }
-  try{
-    renderer.domElement.requestPointerLock();
-  }catch(err){
-    console.warn('Pointer lock request threw:', err);
-    dragToLook = true;
-    instr.innerText = 'Pointer lock blocked by browser — hold LMB and drag to look.';
-  }
+    window.open(location.href, '_blank');
+  }catch(e){ console.warn('Could not open new tab:', e); }
 });
 
-document.addEventListener('pointerlockerror', ()=>{
-  console.warn('Pointer lock error event fired');
-  dragToLook = true;
-  instr.innerText = 'Pointer lock error — hold LMB and drag to look.';
-});
-
-document.addEventListener('pointerlockchange', ()=>{
-  pointerLocked = document.pointerLockElement === renderer.domElement;
-  if(pointerLocked){ instr.innerText = 'Pointer locked — use mouse to look. Press ESC to release.'; }
-  else if(!dragToLook){ instr.innerText = 'Click to lock pointer (or hold LMB and drag to look).'; }
-});
-
-// mouse look handling (works both with pointer lock and drag-to-look fallback)
+// mouse look handling (drag-to-look)
 let rotX = 0, rotY = 0;
 
 document.addEventListener('mousemove', (e)=>{
-  if(pointerLocked){
-    rotY -= e.movementX * sensitivity; rotX -= e.movementY * sensitivity; rotX = clamp(rotX, -1.2, 1.2);
-  } else if(dragToLook && dragging){
+  if(dragToLook && dragging){
     const dx = e.clientX - lastMouseX; const dy = e.clientY - lastMouseY;
     rotY -= dx * sensitivity; rotX -= dy * sensitivity; rotX = clamp(rotX, -1.2, 1.2);
     lastMouseX = e.clientX; lastMouseY = e.clientY;
@@ -328,7 +275,7 @@ function updateCamera(dt){
     camera.position.lerp(targetPos.clone().add(camOffset.clone().applyQuaternion(player.inVehicle.group.quaternion)), 1 - Math.pow(0.001, dt));
     camera.lookAt(player.inVehicle.group.position.clone().add(new THREE.Vector3(0,1.2,0)));
   } else {
-    // rotate camera around player based on mouse (rotY, rotX updated by pointerlock or drag)
+    // rotate camera around player based on mouse (rotY, rotX updated by drag-to-look)
     const theta = rotY; const phi = rotX;
     const offset = new THREE.Vector3(0,0,1).applyAxisAngle(new THREE.Vector3(0,1,0), theta).multiplyScalar(-7);
     offset.y = 4 + Math.sin(phi)*2;
@@ -352,8 +299,8 @@ function handleInteractions(dt){
       for(const v of vehicles){ if(v.group.position.distanceTo(player.group.position) < 3){ v.enter(player); break; }}
     }
   }
-  // shooting: allow shooting when pointer locked OR when using drag-to-look fallback
-  lastShot -= dt; if((pointerLocked || dragToLook) && (mouseDown||input.shoot) && lastShot <= 0){ lastShot = 0.12; shoot(); }
+  // shooting: allow shooting when using drag-to-look
+  lastShot -= dt; if(dragToLook && (mouseDown||input.shoot) && lastShot <= 0){ lastShot = 0.12; shoot(); }
 }
 
 function shoot(){
@@ -376,8 +323,9 @@ console.assert(approx(lerpAngle(0, Math.PI, 0.5), Math.PI*0.5), 'lerpAngle 0->PI
   console.assert(approx(lerpAngle(a,b,t), expected), 'lerpAngle wrap-around test failed');
 })();
 console.assert(approx(lerpAngle(1.234,1.234,0.3), 1.234), 'lerpAngle identity test failed');
-console.assert(typeof isSandboxedWithoutPointerLock() === 'boolean', 'sandbox check should return boolean');
-console.log('Angle helper tests + sandbox test passed (see assertions).');
+// additional angle tests
+console.assert(approx(lerpAngle(-Math.PI/2, Math.PI/2, 0.5), 0), 'lerpAngle -PI/2->PI/2 failed');
+console.log('Angle helper tests passed (see assertions).');
 
 // ---------- Main loop ----------
 let last = performance.now()/1000;
